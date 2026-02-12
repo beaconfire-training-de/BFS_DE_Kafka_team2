@@ -23,42 +23,43 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 """
 
-
 import json
-import random
-import string
+import os
 import sys
 import psycopg2
-from confluent_kafka import Consumer, KafkaError, KafkaException,Message
-from __future__ import annotations
-from typing import Callable, List
-from confluent_kafka.serialization import StringDeserializer
-from employee import Employee
-from producer import employee_topic_name
+from confluent_kafka import Consumer, KafkaError, KafkaException, Producer
+
+# Keep topic names here to avoid importing producer.py (which may pull extra deps)
+EMPLOYEE_TOPIC = "bf_employee_cdc"
+DLQ_TOPIC = "bf_employee_cdc_dlq"  # optional: only used if exists
+
 
 class cdcConsumer(Consumer):
-    #if running outside Docker (i.e. producer is NOT in the docer-compose file): host = localhost and port = 29092
-    #if running inside Docker (i.e. producer IS IN the docer-compose file), host = 'kafka' or whatever name used for the kafka container, port = 9092
-    def __init__(self, host: str = "localhost", port: str = "29092", group_id: str = ''):
-        self.conf = {'bootstrap.servers': f'{host}:{port}',
-                     'group.id': group_id,
-                     'enable.auto.commit': True,
-                     'auto.offset.reset': 'earliest'}
-        super().__init__(self.conf)
+    # if running outside Docker: host=localhost port=29092
+    # if running inside Docker:  host=kafka      port=9092
+    def __init__(self, host: str = "localhost", port: str = "29092", group_id: str = ""):
+        conf = {
+            "bootstrap.servers": f"{host}:{port}",
+            "group.id": group_id,
+            "enable.auto.commit": True,
+            "auto.offset.reset": "earliest",
+        }
+        super().__init__(conf)
         self.keep_runnning = True
         self.group_id = group_id
 
     def consume(self, topics, processing_func):
         try:
             self.subscribe(topics)
-            print(f"[consumer] group_id={self.group_id} subscribed to {topics}")
+            print(f"[consumer] group_id={self.group_id} subscribed to {topics}", flush=True)
+
             while self.keep_runnning:
                 msg = self.poll(timeout=1.0)
+
                 if msg is None:
                     continue
 
                 if msg.error():
-                    # End of partition is not a real error
                     if msg.error().code() == KafkaError._PARTITION_EOF:
                         continue
                     raise KafkaException(msg.error())
@@ -66,82 +67,134 @@ class cdcConsumer(Consumer):
                 try:
                     processing_func(msg)
                 except Exception as err:
-                    # Keep the consumer alive; you can optionally push failures to a DLQ.
-                    print(f"[consumer][ERROR] failed to process message: {err}", file=sys.stderr)
-        except KeyboardInterrupt:
-            print("[consumer] received KeyboardInterrupt, shutting down...")
+                    print(f"[consumer][ERROR] failed to process message: {err}", flush=True)
 
+        except KeyboardInterrupt:
+            print("[consumer] received KeyboardInterrupt, shutting down...", flush=True)
         finally:
             self.close()
 
-def _normalize_action(action: str) -> str:
-    a = (action or "").strip().lower()
-    if a in {"i", "ins", "insert", "create", "c"}:
-        return "insert"
-    if a in {"u", "upd", "update", "modify", "m"}:
-        return "update"
-    if a in {"d", "del", "delete", "remove", "r"}:
-        return "delete"
-    return a
 
+def _decode_value(msg):
+    v = msg.value()
+    if v is None:
+        return None
+    if isinstance(v, (bytes, bytearray)):
+        v = v.decode("utf-8", errors="replace")
+    return v
+
+
+def _is_valid_event(data: dict) -> (bool, str):
+    """Optional validation rules. Return (is_valid, reason)."""
+    try:
+        emp_id = data.get("emp_id")
+        if emp_id is not None and int(emp_id) < 0:
+            return False, "negative emp_id"
+
+        salary = data.get("emp_salary")
+        if salary is not None and int(salary) <= 10000:
+            return False, "salary <= 10000"
+
+        dob = data.get("emp_dob")
+        if dob:
+            if str(dob) < "2007-01-01":
+                return False, "dob < 2007-01-01"
+    except Exception as e:
+        return False, f"validation exception: {e}"
+
+    return True, ""
+
+
+def _send_to_dlq(kafka_host: str, kafka_port: str, data: dict, reason: str):
+    """Best-effort DLQ producer; does nothing if DLQ topic not used."""
+    try:
+        p = Producer({"bootstrap.servers": f"{kafka_host}:{kafka_port}", "acks": "all"})
+        payload = dict(data)
+        payload["_dlq_reason"] = reason
+        p.produce(DLQ_TOPIC, value=json.dumps(payload).encode("utf-8"))
+        p.flush(2)
+    except Exception:
+        pass
 
 
 def update_dst(msg):
-    e = Employee(**(json.loads(msg.value())))
-    e = Employee(**payload)
-    action = _normalize_action(e.action)
-    if action not in {"insert", "update", "delete"}:
-        print(f"[consumer][WARN] unknown action '{e.action}' for emp_id={e.emp_id}; skipping")
+    raw = _decode_value(msg)
+    if not raw:
         return
+
+    data = json.loads(raw)
+
+    # Kafka payload keys (confirmed from your console-consumer output):
+    # action_id, emp_id, emp_FN, emp_LN, emp_dob, emp_city, emp_salary, action
+    action = (data.get("action") or "").lower().strip()
+
+    emp_id = data.get("emp_id")
+    first_name = data.get("emp_FN")
+    last_name = data.get("emp_LN")
+    dob = data.get("emp_dob")
+    city = data.get("emp_city")
+    salary = data.get("emp_salary")
+
+    # Optional validation + DLQ
+    kafka_host = os.environ.get("KAFKA_HOST", "localhost")
+    kafka_port = os.environ.get("KAFKA_PORT", "29092")
+    valid, reason = _is_valid_event(data)
+    if not valid:
+        print(f"[consumer][DLQ] invalid event emp_id={emp_id}: {reason}", flush=True)
+        _send_to_dlq(kafka_host, kafka_port, data, reason)
+        return
+
+    # Destination DB (db_dst) — default host mapping port 5433
+    conn = None
+    cur = None
     try:
         conn = psycopg2.connect(
-            host="localhost",
-            database="postgres",
-            user="postgres",
-            port = '5433', # change this port number to align with the docker compose file
-            password="postgres")
+            host=os.environ.get("DB_HOST", "127.0.0.1"),
+            database=os.environ.get("DB_NAME", "postgres"),
+            user=os.environ.get("DB_USER", "postgres"),
+            port=os.environ.get("DB_DST_PORT", "5433"),
+            password=os.environ.get("DB_PASSWORD", "postgres"),
+            connect_timeout=3,
+        )
         conn.autocommit = True
         cur = conn.cursor()
-        #your logic goes here
-        if action == "delete":
-            cur.execute("DELETE FROM employees WHERE emp_id = %s", (e.emp_id,))
-            print(f"[consumer] DELETE emp_id={e.emp_id} (rows={cur.rowcount})")
 
-        else:
-            # Try UPDATE first (covers 'update' and also makes 'insert' idempotent)
+        if action == "delete":
+            cur.execute("DELETE FROM employees WHERE emp_id = %s;", (emp_id,))
+            return
+
+        cur.execute(
+            """
+            UPDATE employees
+               SET first_name=%s, last_name=%s, dob=%s, city=%s, salary=%s
+             WHERE emp_id=%s;
+            """,
+            (first_name, last_name, dob, city, salary, emp_id),
+        )
+
+        if cur.rowcount == 0:
             cur.execute(
                 """
-                UPDATE employees
-                SET first_name = %s,
-                    last_name  = %s,
-                    dob        = %s,
-                    city       = %s,
-                    salary     = %s
-                WHERE emp_id = %s
+                INSERT INTO employees(emp_id, first_name, last_name, dob, city, salary)
+                VALUES (%s, %s, %s, %s, %s, %s);
                 """,
-                (e.emp_FN, e.emp_LN, e.emp_dob, e.emp_city, e.emp_salary, e.emp_id),
+                (emp_id, first_name, last_name, dob, city, salary),
             )
 
-            if cur.rowcount == 0:
-                # Row does not exist yet => INSERT with the same emp_id from source
-                cur.execute(
-                    """
-                    INSERT INTO employees (emp_id, first_name, last_name, dob, city, salary)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    """,
-                    (e.emp_id, e.emp_FN, e.emp_LN, e.emp_dob, e.emp_city, e.emp_salary),
-                )
-                print(f"[consumer] INSERT emp_id={e.emp_id}")
-            else:
-                print(f"[consumer] UPDATE emp_id={e.emp_id}")
+    finally:
+        try:
+            if cur is not None:
+                cur.close()
+        except Exception:
+            pass
+        try:
+            if conn is not None:
+                conn.close()
+        except Exception:
+            pass
 
 
-
-        cur.close()
-    except Exception as err:
-        print(err)
-
-if __name__ == '__main__':
-    group_id = sys.argv[1] if len(sys.argv) > 1 else "bf_employee_cdc_group"
+if __name__ == "__main__":
+    group_id = sys.argv[1] if len(sys.argv) > 1 else "bf_cdc_group_1"
     consumer = cdcConsumer(group_id=group_id)
-    consumer.consume([employee_topic_name], update_dst)
+    consumer.consume([EMPLOYEE_TOPIC], update_dst)
