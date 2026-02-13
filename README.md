@@ -4,11 +4,11 @@
 ## setup_source.sql -- Shuxuan Li
 
 ### employees table
-- emp_id SERIAL PRIMARY KEY — auto-incrementing employee ID
+- emp_id SERIAL PRIMARY KEY: auto-incrementing employee ID
 - Columns: first_name, last_name, dob, city, salary
 
 ### emp_cdc table (CDC audit log)
-- action_id SERIAL PRIMARY KEY — auto-incrementing change sequence
+- action_id SERIAL PRIMARY KEY: auto-incrementing change sequence
 - Mirrors all employees columns + action VARCHAR(100) to record operation type
 
 ### employee_cdc_trigger_func()
@@ -26,7 +26,7 @@
 
 ### employees table
 - Identical schema to source employees table
-- No trigger — destination is write target for the Kafka consumer
+- No trigger: destination is write target for the Kafka consumer
 
 
 
