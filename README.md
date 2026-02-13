@@ -1,35 +1,34 @@
 # BFS_DE_Kafka_team2
 
 
-### setup_source.sql -- Shuxuan Li
+## setup_source.sql -- Shuxuan Li
 
-**employees table**
+### employees table
 - emp_id SERIAL PRIMARY KEY — auto-incrementing employee ID
 - Columns: first_name, last_name, dob, city, salary
 
-**emp_cdc table (CDC audit log)**
+### emp_cdc table (CDC audit log)
 - action_id SERIAL PRIMARY KEY — auto-incrementing change sequence
 - Mirrors all employees columns + action VARCHAR(100) to record operation type
 
-**employee_cdc_trigger_func()**
+### employee_cdc_trigger_func()
 - PostgreSQL trigger function, RETURNS TRIGGER
 - TG_OP = 'INSERT': captures NEW row → inserts into emp_cdc with action = 'INSERT'
 - TG_OP = 'UPDATE': captures NEW row → inserts into emp_cdc with action = 'UPDATE'
 - TG_OP = 'DELETE': captures OLD row → inserts into emp_cdc with action = 'DELETE'
 
-**employee_cdc_trigger**
+### employee_cdc_trigger
 - AFTER INSERT OR UPDATE OR DELETE ON employees
 - FOR EACH ROW EXECUTE FUNCTION employee_cdc_trigger_func()
 
----
 
-### setup_dst.sql -- Shuxuan Li
+## setup_dst.sql -- Shuxuan Li
 
-**employees table**
+### employees table
 - Identical schema to source employees table
 - No trigger — destination is write target for the Kafka consumer
 
----
+
 
 ## Consumer.py -- Huiyu Song
 
