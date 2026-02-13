@@ -47,7 +47,8 @@ class cdcProducer(Producer):
                           'acks' : 'all'}
         super().__init__(producerConfig)
         self.running = True
-        self.last_cdc_id = 0 # track last processed cdc_id
+
+        self.last_action_id = 0 
 
     def fetch_cdc(self,):
         try:
@@ -61,22 +62,23 @@ class cdcProducer(Producer):
             cur = conn.cursor()
             #your logic should go here
             cur.execute("""
-                SELECT cdc_id, emp_id, first_name, last_name, dob, city, salary, action
+                SELECT action_id, emp_id, first_name, last_name, dob, city, salary, action
                 FROM emp_cdc
-                WHERE cdc_id > %s
-                ORDER BY cdc_id
-            """, (self.last_cdc_id,))
+                WHERE action_id > %s
+                ORDER BY action_id
+            """, (self.last_action_id,))
 
             rows = cur.fetchall()
             for row in rows:
-                cdc_id, emp_id, first_name, last_name, dob, city, salary, action = row
+                action_id, emp_id, first_name, last_name, dob, city, salary, action = row
                 message = {
+                    "action_id": action_id,
                     "emp_id": emp_id,
-                    "first_name": first_name,
-                    "last_name": last_name,
-                    "dob": str(dob),
-                    "city": city,
-                    "salary": salary,
+                    "emp_FN": first_name,
+                    "emp_LN": last_name,
+                    "emp_dob": str(dob),
+                    "emp_city": city,
+                    "emp_salary": salary,
                     "action": action
                 }
 
@@ -86,8 +88,13 @@ class cdcProducer(Producer):
                 key=str(emp_id).encode('utf-8'),
                 value=json.dumps(message).encode('utf-8')
                 )
-                # update last processed ID
-                self.last_cdc_id = cdc_id
+
+                # Update the last_action_id to the current action_id
+                self.last_action_id = action_id
+
+                # print the message being sent to Kafka
+                print(f"[producer] Sent message: {json.dumps(message)}")
+
 
             self.flush()
             cur.close()
