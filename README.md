@@ -29,6 +29,43 @@
 - No trigger: destination is write target for the Kafka consumer
 
 
+## producer.py -- Duc Anh Nguyen
+
+### How It Works:
+
+1. Reads CDC events from emp_cdc table in source DB
+
+2. Formats each row into a JSON message compatible with employee.py.
+
+3. Sends messages to Kafka topic bf_employee_cdc
+
+4. Tracks last_action_id in memory to avoid resending rows: self.last_action_id
+
+5. Continuously polls the source database every 1 second
+
+
+### Database Query Logic
+
+    SELECT action_id, emp_id, first_name, last_name, dob, city, salary, action
+    
+    FROM emp_cdc
+    
+    WHERE action_id > last_action_id
+    
+    ORDER BY action_id
+
+- Only select rows that have the next action_id. This can make sure there are no duplicates.
+
+- For each row:
+
+- Map DB columns → JSON keys matching employee.py
+
+- Send JSON to Kafka with produce(topic, key=str(emp_id), value=json.dumps(message))
+
+- Update last_action_id = action_id
+
+- Flush producer buffer to Kafka
+
 
 ## Consumer.py -- Huiyu Song
 
